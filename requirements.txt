@@ -4,3 +4,4 @@ numpy>=1.26
 plotly>=5.22
 statsmodels>=0.14
 groq>=0.11
+ 
