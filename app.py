@@ -252,8 +252,9 @@ with tab_mapa:
             }[x],
             horizontal=True,
         )
+        resumen_mun_map = resumen_mun.reset_index(drop=True)  # asegura alineación con point_index del clic
         fig_map = px.scatter_mapbox(
-            resumen_mun,
+            resumen_mun_map,
             lat="lat", lon="lon",
             size=metrica_mapa,
             color="ipm",
@@ -261,12 +262,27 @@ with tab_mapa:
             size_max=42,
             zoom=6.4,
             hover_name="municipio",
-            hover_data={
-                "subregion": True, "ipm": ":.1f", "eventos_total": True,
-                "inversion_total_mcop": ":.0f", "empleo_prom": ":.1f",
-                "lat": False, "lon": False,
-            },
             mapbox_style="carto-darkmatter",
+        )
+        # Hover enriquecido: al pasar el mouse sobre un municipio se ve su ficha completa
+        campos_hover = [
+            "subregion", "poblacion_base", "ipm", "indice_institucionalidad",
+            "eventos_total", "eventos_por_10k_hab", "inversion_total_mcop",
+            "empleo_prom", "casos_salud_total",
+        ]
+        fig_map.update_traces(
+            customdata=resumen_mun_map[campos_hover].to_numpy(),
+            hovertemplate=(
+                "<b>%{hovertext}</b><br>"
+                "Subregión: %{customdata[0]}<br>"
+                "Población: %{customdata[1]:,.0f} hab.<br>"
+                "IPM: %{customdata[2]:.1f} · Institucionalidad: %{customdata[3]:.0f}/100<br>"
+                "Eventos: %{customdata[4]:,.0f} totales (%{customdata[5]:.1f} por 10k hab.)<br>"
+                "Inversión pública: $%{customdata[6]:,.0f} MCOP<br>"
+                "Empleo formal: %{customdata[7]:.1f}%<br>"
+                "Casos de salud: %{customdata[8]:,.0f}"
+                "<extra></extra>"
+            ),
         )
         fig_map.update_layout(
             margin=dict(l=0, r=0, t=10, b=0),
@@ -275,8 +291,15 @@ with tab_mapa:
             coloraxis_colorbar=dict(title="IPM"),
             height=520,
         )
-        st.plotly_chart(fig_map, use_container_width=True)
-        st.caption("Mapa real (OpenStreetMap / Carto) — tamaño = métrica elegida, color = Índice de Pobreza Multidimensional (IPM).")
+        evento_mapa = st.plotly_chart(
+            fig_map, use_container_width=True,
+            on_select="rerun", selection_mode="points", key="mapa_click",
+        )
+        st.caption(
+            "Mapa real (OpenStreetMap / Carto) — **pasa el mouse** sobre un municipio para ver su "
+            "ficha rápida, o **haz clic** para abrir su vista detallada abajo. "
+            "Tamaño = métrica elegida, color = Índice de Pobreza Multidimensional (IPM)."
+        )
 
     with col_side:
         st.subheader("Eventos individuales geolocalizados")
@@ -289,6 +312,85 @@ with tab_mapa:
             hide_index=True,
         )
         st.caption(f"{len(eventos_f):,} eventos individuales en el filtro actual.".replace(",", "."))
+
+    # ------------------------------------------------------------------
+    # 📍 Ficha municipal — vista detallada de UN municipio
+    # Se activa haciendo clic en una burbuja del mapa, o eligiéndolo manualmente.
+    # ------------------------------------------------------------------
+    st.divider()
+    st.subheader("📍 Ficha municipal")
+
+    lista_municipios_orden = sorted(resumen_mun_map["municipio"].tolist())
+    municipio_click = None
+    if evento_mapa and evento_mapa.get("selection", {}).get("points"):
+        idx_click = evento_mapa["selection"]["points"][0]["point_index"]
+        municipio_click = resumen_mun_map.iloc[idx_click]["municipio"]
+        st.session_state["municipio_ficha"] = municipio_click
+
+    if "municipio_ficha" not in st.session_state or st.session_state["municipio_ficha"] not in lista_municipios_orden:
+        st.session_state["municipio_ficha"] = lista_municipios_orden[0]
+
+    municipio_ficha = st.selectbox(
+        "Municipio seleccionado (clic en el mapa o elige aquí)",
+        lista_municipios_orden,
+        index=lista_municipios_orden.index(st.session_state["municipio_ficha"]),
+        key="selectbox_ficha",
+    )
+    st.session_state["municipio_ficha"] = municipio_ficha
+
+    fila = resumen_mun_map[resumen_mun_map["municipio"] == municipio_ficha].iloc[0]
+    prom = resumen_mun_map.mean(numeric_only=True)
+
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    fc1.metric("IPM", f"{fila['ipm']:.1f}", delta=f"{fila['ipm'] - prom['ipm']:+.1f} vs prom.", delta_color="inverse")
+    fc2.metric("Población", f"{int(fila['poblacion_base']):,}".replace(",", "."))
+    fc3.metric(
+        "Eventos / 10k hab.", f"{fila['eventos_por_10k_hab']:.1f}",
+        delta=f"{fila['eventos_por_10k_hab'] - prom['eventos_por_10k_hab']:+.1f} vs prom.", delta_color="inverse",
+    )
+    fc4.metric(
+        "Inversión pública", f"${fila['inversion_total_mcop']:,.0f} MCOP".replace(",", "."),
+        delta=f"{fila['inversion_total_mcop'] - prom['inversion_total_mcop']:+,.0f} vs prom.".replace(",", "."),
+    )
+    fc5.metric(
+        "Empleo formal", f"{fila['empleo_prom']:.1f}%",
+        delta=f"{fila['empleo_prom'] - prom['empleo_prom']:+.1f} pts vs prom.",
+    )
+
+    fcol_ts, fcol_ev = st.columns([1.6, 1])
+    with fcol_ts:
+        st.markdown(f"**Evolución mensual — {municipio_ficha}** (índice, base 100 = inicio del periodo)")
+        serie_m = series_f[series_f["municipio"] == municipio_ficha].sort_values("fecha").copy()
+        if not serie_m.empty:
+            norm_m = serie_m[["fecha"]].copy()
+            for col, nombre_col in [
+                ("eventos_seguridad", "Eventos"), ("inversion_publica_mcop", "Inversión"),
+                ("empleo_formal_tasa", "Empleo"), ("casos_salud", "Casos de salud"),
+            ]:
+                base_val = serie_m[col].iloc[0] if serie_m[col].iloc[0] != 0 else 1
+                norm_m[nombre_col] = serie_m[col] / base_val * 100
+            fig_m = go.Figure()
+            colores_m = {"Eventos": "#C1440E", "Inversión": "#E3B23C", "Empleo": "#4FA8A0", "Casos de salud": "#8FB8DE"}
+            for nombre_col, color in colores_m.items():
+                fig_m.add_trace(go.Scatter(x=norm_m["fecha"], y=norm_m[nombre_col], name=nombre_col, line=dict(color=color)))
+            fig_m.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                font_color="#EDEBE3", height=340, yaxis_title="Índice (base 100)", margin=dict(t=10),
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+        else:
+            st.info("Sin datos de serie de tiempo para el rango de fechas filtrado.")
+
+    with fcol_ev:
+        st.markdown(f"**Eventos recientes en {municipio_ficha}**")
+        eventos_m = eventos_f[eventos_f["municipio"] == municipio_ficha].sort_values(
+            ["gravedad", "fecha"], ascending=[False, False]
+        )
+        st.dataframe(
+            eventos_m[["fecha", "tipo_evento", "gravedad"]].head(12),
+            use_container_width=True, hide_index=True, height=340,
+        )
+        st.caption(f"{len(eventos_m):,} eventos totales en {municipio_ficha} dentro del filtro actual.".replace(",", "."))
 
     st.divider()
     st.subheader("Ranking de municipios")
@@ -519,32 +621,63 @@ with tab_ia:
 
     if "chat_historial" not in st.session_state:
         st.session_state.chat_historial = []
+    if "prompt_click" not in st.session_state:
+        st.session_state.prompt_click = None
+
+    # ------------------------------------------------------------------
+    # 💡 Ejemplos explícitos de uso — para que el usuario entienda QUÉ
+    # puede preguntar y cómo el modelo puede ayudarle a interpretar los datos.
+    # ------------------------------------------------------------------
+    EJEMPLOS_CHAT = {
+        "🔍 Diagnóstico general": [
+            "¿Qué municipios requieren atención prioritaria y por qué?",
+            "Dame un resumen ejecutivo de la situación actual en 5 líneas.",
+        ],
+        "📈 Series de tiempo y tendencias": [
+            "¿Cómo ha evolucionado la inversión pública en los últimos 12 meses?",
+            "¿Hay estacionalidad en los casos de salud? ¿En qué meses suben más?",
+        ],
+        "🔗 Correlaciones y causalidad": [
+            "Explica la relación entre inversión pública y empleo formal en este grupo.",
+            "¿Por qué la correlación entre inversión y empleo se ve negativa entre municipios?",
+        ],
+        "🏛️ Política pública": [
+            "Dame 3 recomendaciones de política pública basadas en estos datos.",
+            "Si tuviera 500 millones adicionales, ¿en qué municipio los invertirías y por qué?",
+        ],
+        "⚠️ Riesgos y comparaciones": [
+            "¿Qué municipio tiene el perfil de riesgo más alto combinando IPM y eventos?",
+            "Compara los dos municipios seleccionados en todas las dimensiones disponibles.",
+        ],
+    }
+
+    with st.expander("💡 Ejemplos de lo que puedes preguntarle al analista IA", expanded=len(st.session_state.chat_historial) == 0):
+        st.caption(
+            "El modelo (Llama 3.3 70B vía Groq) ve un resumen numérico de los datos que tienes "
+            "filtrados ahora mismo en el panel lateral. Haz clic en cualquier ejemplo para enviarlo, "
+            "o escribe tu propia pregunta abajo — funciona mejor si es específica y menciona "
+            "municipios, periodos o variables concretas."
+        )
+        cols_ejemplos = st.columns(len(EJEMPLOS_CHAT))
+        for col, (categoria, preguntas) in zip(cols_ejemplos, EJEMPLOS_CHAT.items()):
+            with col:
+                st.markdown(f"**{categoria}**")
+                for i, pregunta in enumerate(preguntas):
+                    if st.button(pregunta, key=f"ejemplo_{categoria}_{i}", use_container_width=True):
+                        st.session_state.prompt_click = pregunta
 
     for msg in st.session_state.chat_historial:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    colb1, colb2 = st.columns([1, 5])
-    with colb1:
-        if st.button("🧹 Limpiar chat"):
-            st.session_state.chat_historial = []
-            st.rerun()
-    with colb2:
-        sugerencias = st.selectbox(
-            "Preguntas sugeridas",
-            [
-                "— Elige una pregunta rápida —",
-                "¿Qué municipios requieren atención prioritaria y por qué?",
-                "Explica la relación entre inversión pública y empleo formal en este grupo.",
-                "¿Qué hipótesis explicarían los municipios con más eventos por habitante?",
-                "Dame 3 recomendaciones de política pública basadas en estos datos.",
-            ],
-            label_visibility="collapsed",
-        )
+    if st.button("🧹 Limpiar chat"):
+        st.session_state.chat_historial = []
+        st.rerun()
 
     prompt_usuario = st.chat_input("Pregúntale al analista IA sobre los datos filtrados...")
-    if sugerencias != "— Elige una pregunta rápida —" and not prompt_usuario:
-        prompt_usuario = sugerencias
+    if not prompt_usuario and st.session_state.prompt_click:
+        prompt_usuario = st.session_state.prompt_click
+        st.session_state.prompt_click = None
 
     if prompt_usuario:
         if not groq_api_key:
