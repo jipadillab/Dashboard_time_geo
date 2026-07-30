@@ -23,6 +23,65 @@ import streamlit as st
 from data_generator import generar_todo, TIPOS_EVENTO
 
 # ---------------------------------------------------------------------------
+# Utilidades geoespaciales
+# ---------------------------------------------------------------------------
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Distancia en km entre dos puntos geográficos (fórmula haversine)."""
+    R = 6371.0
+    p1, p2 = np.radians(lat1), np.radians(lat2)
+    dphi = np.radians(lat2 - lat1)
+    dlambda = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlambda / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
+
+
+def separar_puntos_cercanos(lats, lons, umbral_km=12.0, radio_grados=0.055):
+    """Cuando dos o más municipios están muy cerca entre sí en la realidad
+    (p. ej. el Valle de Aburrá), sus burbujas se superponen en el mapa y se
+    vuelven ilegibles. Esta función NO altera los datos: solo calcula una
+    posición VISUAL ligeramente separada en abanico alrededor del centroide
+    real del grupo, para que cada municipio se pueda distinguir y clickear
+    por separado. La coordenada real se conserva y se sigue mostrando en el
+    tooltip y en la Ficha municipal."""
+    n = len(lats)
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    padre = list(range(n))
+
+    def encontrar(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    def unir(a, b):
+        ra, rb = encontrar(a), encontrar(b)
+        if ra != rb:
+            padre[ra] = rb
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _haversine_km(lats[i], lons[i], lats[j], lons[j]) < umbral_km:
+                unir(i, j)
+
+    grupos = {}
+    for i in range(n):
+        grupos.setdefault(encontrar(i), []).append(i)
+
+    disp_lat, disp_lon = lats.copy(), lons.copy()
+    for indices in grupos.values():
+        if len(indices) < 2:
+            continue
+        centro_lat, centro_lon = lats[indices].mean(), lons[indices].mean()
+        k = len(indices)
+        for pos, idx in enumerate(indices):
+            angulo = 2 * np.pi * pos / k
+            disp_lat[idx] = centro_lat + radio_grados * np.sin(angulo)
+            disp_lon[idx] = centro_lon + radio_grados * np.cos(angulo) * 1.35
+    return disp_lat, disp_lon
+
+
+# ---------------------------------------------------------------------------
 # Configuración de página
 # ---------------------------------------------------------------------------
 st.set_page_config(
@@ -253,52 +312,87 @@ with tab_mapa:
             horizontal=True,
         )
         resumen_mun_map = resumen_mun.reset_index(drop=True)  # asegura alineación con point_index del clic
-        fig_map = px.scatter_mapbox(
-            resumen_mun_map,
-            lat="lat", lon="lon",
-            size=metrica_mapa,
-            color="ipm",
-            color_continuous_scale=["#4FA8A0", "#E3B23C", "#C1440E"],
-            size_max=42,
-            zoom=6.4,
-            hover_name="municipio",
-            mapbox_style="carto-darkmatter",
+
+        # 1) Separar visualmente municipios muy cercanos entre sí (evita el
+        #    "blob" ilegible del Valle de Aburrá) sin tocar los datos reales.
+        disp_lat, disp_lon = separar_puntos_cercanos(
+            resumen_mun_map["lat"], resumen_mun_map["lon"]
         )
-        # Hover enriquecido: al pasar el mouse sobre un municipio se ve su ficha completa
+
+        # 2) Tamaño de burbuja normalizado a un rango fijo en píxeles (más
+        #    legible que dejar que Plotly escale automáticamente valores muy
+        #    dispares) y colorscale de alto contraste sobre fondo oscuro.
+        valores_tam = resumen_mun_map[metrica_mapa].to_numpy(dtype=float)
+        vmin, vmax = valores_tam.min(), valores_tam.max()
+        tam_norm = (valores_tam - vmin) / (vmax - vmin) if vmax > vmin else np.full_like(valores_tam, 0.5)
+        TAM_MIN, TAM_MAX = 16, 40
+        tamanos = TAM_MIN + tam_norm * (TAM_MAX - TAM_MIN)
+
+        COLORSCALE_IPM = [[0.0, "#22D3B4"], [0.5, "#FFCB3D"], [1.0, "#FF4D6A"]]
+
         campos_hover = [
             "subregion", "poblacion_base", "ipm", "indice_institucionalidad",
             "eventos_total", "eventos_por_10k_hab", "inversion_total_mcop",
             "empleo_prom", "casos_salud_total",
         ]
-        fig_map.update_traces(
-            customdata=resumen_mun_map[campos_hover].to_numpy(),
-            hovertemplate=(
-                "<b>%{hovertext}</b><br>"
-                "Subregión: %{customdata[0]}<br>"
-                "Población: %{customdata[1]:,.0f} hab.<br>"
-                "IPM: %{customdata[2]:.1f} · Institucionalidad: %{customdata[3]:.0f}/100<br>"
-                "Eventos: %{customdata[4]:,.0f} totales (%{customdata[5]:.1f} por 10k hab.)<br>"
-                "Inversión pública: $%{customdata[6]:,.0f} MCOP<br>"
-                "Empleo formal: %{customdata[7]:.1f}%<br>"
-                "Casos de salud: %{customdata[8]:,.0f}"
-                "<extra></extra>"
-            ),
+        hovertemplate = (
+            "<b>%{hovertext}</b><br>"
+            "Subregión: %{customdata[0]}<br>"
+            "Población: %{customdata[1]:,.0f} hab.<br>"
+            "IPM: %{customdata[2]:.1f} · Institucionalidad: %{customdata[3]:.0f}/100<br>"
+            "Eventos: %{customdata[4]:,.0f} totales (%{customdata[5]:.1f} por 10k hab.)<br>"
+            "Inversión pública: $%{customdata[6]:,.0f} MCOP<br>"
+            "Empleo formal: %{customdata[7]:.1f}%<br>"
+            "Casos de salud: %{customdata[8]:,.0f}"
+            "<extra></extra>"
         )
+
+        # Halo/borde (dibujado primero, debajo) — le da a cada burbuja un
+        # contorno claro que la separa visualmente del mapa oscuro y de sus
+        # vecinas, incluso cuando se solapan parcialmente.
+        traza_halo = go.Scattermapbox(
+            lat=disp_lat, lon=disp_lon, mode="markers",
+            marker=dict(size=tamanos + 7, sizemode="diameter", color="rgba(237,235,227,0.85)"),
+            hoverinfo="skip", showlegend=False,
+        )
+        # Burbuja principal, coloreada por IPM
+        traza_principal = go.Scattermapbox(
+            lat=disp_lat, lon=disp_lon, mode="markers",
+            marker=dict(
+                size=tamanos, sizemode="diameter",
+                color=resumen_mun_map["ipm"], colorscale=COLORSCALE_IPM,
+                cmin=municipios_df["ipm"].min(), cmax=municipios_df["ipm"].max(),
+                opacity=0.92,
+                colorbar=dict(title="IPM", thickness=14, len=0.55, tickfont=dict(color="#EDEBE3"), title_font=dict(color="#EDEBE3")),
+            ),
+            hovertext=resumen_mun_map["municipio"],
+            customdata=resumen_mun_map[campos_hover].to_numpy(),
+            hovertemplate=hovertemplate,
+            showlegend=False,
+        )
+        fig_map = go.Figure(data=[traza_halo, traza_principal])
         fig_map.update_layout(
+            mapbox=dict(
+                style="carto-darkmatter",
+                zoom=6.3,
+                center=dict(lat=resumen_mun_map["lat"].mean(), lon=resumen_mun_map["lon"].mean()),
+            ),
             margin=dict(l=0, r=0, t=10, b=0),
             paper_bgcolor="rgba(0,0,0,0)",
             font_color="#EDEBE3",
-            coloraxis_colorbar=dict(title="IPM"),
-            height=520,
+            height=560,
         )
         evento_mapa = st.plotly_chart(
             fig_map, use_container_width=True,
             on_select="rerun", selection_mode="points", key="mapa_click",
         )
         st.caption(
-            "Mapa real (OpenStreetMap / Carto) — **pasa el mouse** sobre un municipio para ver su "
+            "Mapa real (Carto Dark Matter) — **pasa el mouse** sobre un municipio para ver su "
             "ficha rápida, o **haz clic** para abrir su vista detallada abajo. "
-            "Tamaño = métrica elegida, color = Índice de Pobreza Multidimensional (IPM)."
+            "Tamaño = métrica elegida, color = Índice de Pobreza Multidimensional (IPM). "
+            "Los municipios del Valle de Aburrá (muy cercanos entre sí en la realidad) se "
+            "separan ligeramente en abanico solo para que puedas distinguirlos y hacer clic — "
+            "la ubicación exacta sigue disponible en el tooltip y en la Ficha municipal."
         )
 
     with col_side:
